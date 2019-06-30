@@ -1,0 +1,532 @@
+diff --git app/controllers/issues_controller.rb b/app/controllers/issues_controller.rb
+index e1a3d860c0..10bd07c221 100644
+--- app/controllers/issues_controller.rb
++++ b/app/controllers/issues_controller.rb
+@@ -23,6 +23,7 @@ class IssuesController < ApplicationController
+   before_action :authorize, :except => [:index, :new, :create]
+   before_action :find_optional_project, :only => [:index, :new, :create]
+   before_action :build_new_issue_from_params, :only => [:new, :create]
++  before_action :with_default_query, only: [:index]
+   accept_rss_auth :index, :show
+   accept_api_auth :index, :show, :create, :update, :destroy
+ 
+@@ -414,6 +415,28 @@ class IssuesController < ApplicationController
+ 
+   private
+ 
++  def with_default_query
++    return if params[:query_id].present?
++    return if api_request?
++    return if  params[:set_filter] && params.key?(:op) && params.key?(:f)
++    params[:set_filter] = 1 and return if params[:without_default].present?
++    apply_default_query! and return if params[:set_filter] && [:op, :f].all? {|k| !params.key?(k) }
++    if session[:issue_query]
++      query_id, project_id = session[:issue_query].values_at(:id, :project_id)
++      unless query_id && (project_id == @project.id) && IssueQuery.available_query?(@project.id, query_id)
++        apply_default_query!
++      end
++    else
++      apply_default_query!
++    end
++  end
++
++  def apply_default_query!
++    if default_query = find_default_query
++      params[:query_id] = default_query.id
++    end
++  end
++
+   def retrieve_previous_and_next_issue_ids
+     if params[:prev_issue_id].present? || params[:next_issue_id].present?
+       @prev_issue_id = params[:prev_issue_id].presence.try(:to_i)
+diff --git app/helpers/projects_helper.rb b/app/helpers/projects_helper.rb
+index 7945461635..b44ce4f6b9 100644
+--- app/helpers/projects_helper.rb
++++ b/app/helpers/projects_helper.rb
+@@ -95,6 +95,17 @@ module ProjectsHelper
+     principals_options_for_select(assignable_users, project.default_assigned_to)
+   end
+ 
++  def project_default_query_options(project)
++    grouped = Hash.new {|h,k| h[k] = []}
++    IssueQuery.only_public.where(project_id: nil).each do |query|
++      grouped[l('label_default_queries.for_all_projects')] << [query.name, query.id]
++    end
++    IssueQuery.only_public.where(project: project).each do |query|
++      grouped[l('label_default_queries.for_current_project')] << [query.name, query.id]
++    end
++    grouped_options_for_select(grouped, project.default_query_id)
++  end
++
+   def format_version_sharing(sharing)
+     sharing = 'none' unless Version::VERSION_SHARINGS.include?(sharing)
+     l("label_version_sharing_#{sharing}")
+diff --git app/helpers/queries_helper.rb b/app/helpers/queries_helper.rb
+index 01d10d883c..e2b8ed6cf5 100644
+--- app/helpers/queries_helper.rb
++++ b/app/helpers/queries_helper.rb
+@@ -335,9 +335,17 @@ module QueriesHelper
+         @query.project = @project
+       end
+       @query
++    else
++      @query = find_default_query
+     end
+   end
+ 
++  private
++
++  def find_default_query
++    @project.default_query if @project.is_a?(Project)
++  end
++
+   # Returns the query definition as hidden field tags
+   def query_as_hidden_field_tags(query)
+     tags = hidden_field_tag("set_filter", "1", :id => nil)
+diff --git app/models/issue_query.rb b/app/models/issue_query.rb
+index 6bb2bc217a..b374be22e3 100644
+--- app/models/issue_query.rb
++++ b/app/models/issue_query.rb
+@@ -50,11 +50,29 @@ class IssueQuery < Query
+     QueryColumn.new(:last_notes, :caption => :label_last_notes, :inline => false)
+   ]
+ 
++  has_many :projects, :foreign_key => 'default_query_id'
++  after_update { self.projects.clear unless self.public_visibility? }
++  after_destroy { self.projects.clear }
++
++  scope :only_public, -> {
++    where(:visibility => VISIBILITY_PUBLIC)
++  }
++
++  def self.available_query?(project_id, query_id)
++    self.only_public
++        .where('project_id is null or project_id = ?', project_id)
++        .where(id: query_id).exists?
++  end
++
+   def initialize(attributes=nil, *args)
+     super attributes
+     self.filters ||= { 'status_id' => {:operator => "o", :values => [""]} }
+   end
+ 
++  def public_visibility?
++    visibility == VISIBILITY_PUBLIC
++  end
++
+   def draw_relations
+     r = options[:draw_relations]
+     r.nil? || r == '1'
+diff --git app/models/project.rb b/app/models/project.rb
+index 5f2f2fb102..b112f6f30a 100644
+--- app/models/project.rb
++++ b/app/models/project.rb
+@@ -56,6 +56,8 @@ class Project < ActiveRecord::Base
+                           :class_name => 'IssueCustomField',
+                           :join_table => "#{table_name_prefix}custom_fields_projects#{table_name_suffix}",
+                           :association_foreign_key => 'custom_field_id'
++  # Default Custom Query
++  belongs_to :default_query, :class_name => 'IssueQuery'
+ 
+   acts_as_attachable :view_permission => :view_files,
+                      :edit_permission => :manage_files,
+@@ -756,7 +758,8 @@ class Project < ActiveRecord::Base
+     'issue_custom_field_ids',
+     'parent_id',
+     'default_version_id',
+-    'default_assigned_to_id'
++    'default_assigned_to_id',
++    'default_query_id'
+ 
+   safe_attributes 'enabled_module_names',
+     :if => lambda {|project, user|
+diff --git app/views/issues/_sidebar.html.erb b/app/views/issues/_sidebar.html.erb
+index 38d682b048..5b64687618 100644
+--- app/views/issues/_sidebar.html.erb
++++ b/app/views/issues/_sidebar.html.erb
+@@ -1,7 +1,7 @@
+ <h3><%= l(:label_issue_plural) %></h3>
+ 
+ <ul>
+-<li><%= link_to l(:label_issue_view_all), _project_issues_path(@project, :set_filter => 1) %></li>
++<li><%= link_to l(:label_issue_view_all), _project_issues_path(@project, :set_filter => 1, :without_default => 1) %></li>
+ <% if @project %>
+ <li><%= link_to l(:field_summary), project_issues_report_path(@project) %></li>
+ <% end %>
+diff --git app/views/projects/_form.html.erb b/app/views/projects/_form.html.erb
+index fc758f4e92..492c8c48b9 100644
+--- app/views/projects/_form.html.erb
++++ b/app/views/projects/_form.html.erb
+@@ -23,6 +23,13 @@
+ <p><%= f.check_box :inherit_members %></p>
+ <% end %>
+ 
++<% if @project.safe_attribute?('default_query_id') && project_default_query_options(@project).present? %>
++  <p>
++    <%= f.select :default_query_id, project_default_query_options(@project), :include_blank => true %>
++    <em class="info"><%=l 'text_allowed_queries_to_select' %></em>
++  </p>
++<% end %>
++
+ <%= wikitoolbar_for 'project_description' %>
+ 
+ <% @project.custom_field_values.each do |value| %>
+diff --git app/views/projects/copy.html.erb b/app/views/projects/copy.html.erb
+index f5524b9658..bceac83f0c 100644
+--- app/views/projects/copy.html.erb
++++ b/app/views/projects/copy.html.erb
+@@ -27,3 +27,13 @@
+ 
+ <%= submit_tag l(:button_copy) %>
+ <% end %>
++
++<%= javascript_tag do %>
++  $('input[value="queries"]').change(function() {
++    if ($(this).prop('checked')){
++      $('select#project_default_query_id optgroup[label="For current project"] option').prop("disabled", false);
++    }else{
++      $('select#project_default_query_id optgroup[label="For current project"] option').prop("disabled", true);
++    }
++  });
++<% end %>
+\ No newline at end of file
+diff --git config/locales/en.yml b/config/locales/en.yml
+index d8f09431f0..1fb1093702 100644
+--- config/locales/en.yml
++++ b/config/locales/en.yml
+@@ -371,6 +371,7 @@ en:
+   field_time_entries_visibility: Time logs visibility
+   field_total_estimated_hours: Total estimated time
+   field_default_version: Default version
++  field_default_query: Default Query
+   field_remote_ip: IP address
+   field_textarea_font: Font used for text areas
+   field_updated_by: Updated by
+@@ -1026,6 +1027,9 @@ en:
+   label_font_monospace: Monospaced font
+   label_font_proportional: Proportional font
+   label_last_notes: Last notes
++  label_default_queries:
++    for_all_projects: For all projects
++    for_current_project: For current project
+ 
+   button_login: Login
+   button_submit: Submit
+@@ -1217,6 +1221,7 @@ en:
+   description_issue_category_reassign: Choose issue category
+   description_wiki_subpages_reassign: Choose new parent page
+   text_repository_identifier_info: 'Only lower case letters (a-z), numbers, dashes and underscores are allowed.<br />Once saved, the identifier cannot be changed.'
++  text_allowed_queries_to_select: Public (to any users) queries only selectable
+   text_login_required_html: When not requiring authentication, public projects and their contents are openly available on the network. You can <a href="%{anonymous_role_path}">edit the applicable permissions</a>.
+   label_login_required_yes: "Yes"
+   label_login_required_no: "No, allow anonymous access to public projects"
+diff --git config/locales/fr.yml b/config/locales/fr.yml
+index 8afc7d5d57..56cb672b43 100644
+--- config/locales/fr.yml
++++ b/config/locales/fr.yml
+@@ -1228,6 +1228,12 @@ fr:
+   mail_body_security_notification_notify_enabled: Les notifications ont été activées pour l'adresse %{value}
+   mail_body_security_notification_notify_disabled: Les notifications ont été désactivées pour l'adresse %{value}
+   field_remote_ip: Adresse IP
++
++  field_default_query: Rapport par défaut
++  label_default_queries:
++    for_all_projects: Pour tous les projets
++    for_current_project: Pour le projet en cours
++  text_allowed_queries_to_select: Seuls les rapports publics (pour tous les utilisateurs) sont sélectionnables
+   label_no_preview: Aucun aperçu disponible
+   label_no_preview_alternative_html: Aucun aperçu disponible. Veuillez %{link} le fichier.
+   label_no_preview_download: télécharger
+diff --git config/locales/ru.yml b/config/locales/ru.yml
+index 2871cc4126..98fbfff88d 100644
+--- config/locales/ru.yml
++++ b/config/locales/ru.yml
+@@ -1284,6 +1284,12 @@ ru:
+     получает уведомления.
+   mail_body_settings_updated: ! 'Следующие настройки были изменены:'
+   field_remote_ip: IP адрес
++
++  field_default_query: Выбор запроса по умолчанию
++  label_default_queries:
++    for_all_projects: Для всех проектов
++    for_current_project: Для текущего прооекта
++  text_allowed_queries_to_select: Для выбора доступны только публичные запросы (фильтры задач)
+   label_wiki_page_new: Новая wiki-страница
+   label_relations: Связи
+   button_filter: Фильтр
+diff --git config/locales/tr.yml b/config/locales/tr.yml
+index 0ab4c6d42b..d8852238a3 100644
+--- config/locales/tr.yml
++++ b/config/locales/tr.yml
+@@ -1192,6 +1192,13 @@ tr:
+     receives notifications.
+   mail_body_settings_updated: ! 'The following settings were changed:'
+   field_remote_ip: IP address
++
++  field_default_query: Öntanımlı özel sorgu
++  label_default_queries:
++    for_all_projects: Tüm birimler için
++    for_current_project: Simdiki birim için
++  text_allowed_queries_to_select: Herkese açık (tüm kullanıcılar) sorgular sadece seçilebilir
++
+   label_wiki_page_new: New wiki page
+   label_relations: Relations
+   button_filter: Filter
+diff --git db/migrate/20160404094730_add_projects_default_query_id.rb b/db/migrate/20160404094730_add_projects_default_query_id.rb
+new file mode 100644
+index 0000000000..483408f03b
+--- /dev/null
++++ b/db/migrate/20160404094730_add_projects_default_query_id.rb
+@@ -0,0 +1,11 @@
++class AddProjectsDefaultQueryId < ActiveRecord::Migration[4.2]
++  def self.up
++    unless column_exists?(:projects, :default_query_id, :integer)
++      add_column :projects, :default_query_id, :integer, :default => nil
++    end
++  end
++
++  def self.down
++    remove_column :projects, :default_query_id
++  end
++end
+diff --git test/functional/issues_controller_test.rb b/test/functional/issues_controller_test.rb
+index 61b2ded0c5..d8c8cf934c 100644
+--- a/test/functional/issues_controller_test.rb
++++ b/test/functional/issues_controller_test.rb
+@@ -508,6 +508,135 @@ class IssuesControllerTest < Redmine::ControllerTest
+     assert_response :success
+   end
+ 
++  def test_default_query_should_be_available_when_default_query_spacified
++    project = Project.find(1)
++    default_query = IssueQuery.create!(:name => "default_query", :user => User.find(2), :visibility => IssueQuery::VISIBILITY_PUBLIC, :project => nil)
++    project.default_query_id = default_query.id
++    project.save!
++
++    @request.session[:user_id] = 3
++
++    get :index, :params => {
++      :project_id => 1
++    }
++    assert_response :success
++    assert_select 'h2', text: default_query.name
++    assert_select 'ul.queries a.selected', text: default_query.name
++  end
++
++  def test_default_query_should_be_unavailable_when_default_query_does_not_spacified
++    project = Project.find(1)
++    project.default_query_id = nil
++    project.save!
++
++    @request.session[:user_id] = 3
++
++    get :index, :params => {
++      :project_id => 1
++    }
++    assert_response :success
++    assert_select 'h2', text: l(:label_issue_plural)
++    assert_select 'ul.queries a.selected', false
++  end
++
++  def test_default_query_should_be_unavailable_when_default_query_spacified_but_params_query_id_spacifired
++    project = Project.find(1)
++    default_query = IssueQuery.create!(:name => "default_query", :user => User.find(2), :visibility => IssueQuery::VISIBILITY_PUBLIC, :project => nil)
++    project.default_query_id = default_query.id
++    project.save!
++    other_query = IssueQuery.create!(:name => "other_query", :user => User.find(2), :visibility => IssueQuery::VISIBILITY_PUBLIC, :project => nil)
++
++    @request.session[:user_id] = 3
++
++    get :index, :params => {
++      :project_id => 1, :query_id => other_query.id
++    }
++    assert_response :success
++    assert_select 'h2', text: other_query.name
++    assert_select 'ul.queries a.selected', text: other_query.name
++  end
++
++  def test_default_query_should_be_unavailable_when_default_query_spacified_but_other_available_query_spacified_in_session
++    project = Project.find(1)
++    default_query = IssueQuery.create!(:name => "default_query", :user => User.find(2), :visibility => IssueQuery::VISIBILITY_PUBLIC, :project => nil)
++    project.default_query_id = default_query.id
++    project.save!
++    other_query = IssueQuery.create!(:name => "other_query", :user => User.find(2), :visibility => IssueQuery::VISIBILITY_PUBLIC, :project => nil)
++
++    @request.session[:user_id] = 3
++    @request.session[:issue_query] = {}
++    @request.session[:issue_query][:id] = other_query.id
++    @request.session[:issue_query][:project_id] = 1
++
++    get :index, :params => {
++      :project_id => 1
++    }
++    assert_response :success
++    assert_select 'h2', text: other_query.name
++    assert_select 'ul.queries a.selected', text: other_query.name
++  end
++
++  def test_default_query_should_be_unavailable_when_param_without_default_spacified
++    project = Project.find(1)
++
++    default_query = IssueQuery.create!(:name => "default_query", :user => User.find(2), :visibility => IssueQuery::VISIBILITY_PUBLIC, :project => nil)
++    project.default_query_id = default_query.id
++    project.save!
++
++    @request.session[:user_id] = 3
++
++    get :index, :params => {
++      :project_id => 1, :without_default => 1
++    }
++    assert_response :success
++    assert_select 'h2', text: l(:label_issue_plural)
++    assert_select 'ul.queries a.selected', false
++  end
++
++  def test_default_query_should_be_unavailable_when_params_set_filter_and_op_and_f_spacified
++    project = Project.find(1)
++
++    default_query = IssueQuery.create!(:name => "default_custom_query", :user => User.find(2), :visibility => IssueQuery::VISIBILITY_PUBLIC, :project => nil)
++    project.default_query_id = default_query.id
++    project.save!
++
++    @request.session[:user_id] = 3
++
++    get :index, :params => {
++      :project_id => 1, :set_filter => 1,
++      :f => ['start_date'],
++      :op => {
++        :start_date => '='
++      }
++    }
++    assert_response :success
++    assert_select 'h2', text: l(:label_issue_plural)
++    assert_select 'ul.queries a.selected', false
++  end
++
++  def test_default_query_should_be_available_when_default_query_spacified_and_other_unavailable_query_spacified_in_session
++    project = Project.find(1)
++    default_query = IssueQuery.create!(:name => "default_query", :user => User.find(2), :visibility => IssueQuery::VISIBILITY_PUBLIC, :project => nil)
++    project.default_query_id = default_query.id
++    project.save!
++    other_query = IssueQuery.create!(:name => "other_query", :user => User.find(2), :visibility => IssueQuery::VISIBILITY_PUBLIC, :project => nil)
++
++    @request.session[:user_id] = 3
++    @request.session[:issue_query] = {}
++    @request.session[:issue_query][:id] = other_query.id
++    @request.session[:issue_query][:project_id] = 1
++
++    other_query.visibility = IssueQuery::VISIBILITY_PRIVATE
++    other_query.save!
++
++    get :index, :params => {
++      :project_id => 1
++    }
++    assert_response :success
++    assert_select 'h2', text: default_query.name
++    assert_select 'ul.queries a.selected', text: default_query.name
++  end
++
+   def test_index_should_omit_page_param_in_export_links
+     get :index, :params => {
+         :page => 2
+diff --git test/helpers/projects_helper_test.rb b/test/helpers/projects_helper_test.rb
+index 356f6c03e6..09d149b7fd 100644
+--- a/test/helpers/projects_helper_test.rb
++++ b/test/helpers/projects_helper_test.rb
+@@ -75,4 +75,14 @@ class ProjectsHelperTest < Redmine::HelperTest
+     assert_equal '', version_options_for_select([])
+     assert_equal '', version_options_for_select([], Version.find(1))
+   end
++
++  def test_project_default_query_options
++    project = Project.find(2)
++    options = project_default_query_options(project)
++    assert_includes options, l('label_default_queries.for_all_projects')
++
++    assert_includes options, options_for_select(IssueQuery.only_public.where(:project_id => nil).collect{|q|[q.name, q.id]})
++    assert_includes options, l('label_default_queries.for_current_project')
++    assert_includes options, options_for_select(IssueQuery.only_public.where(project: project).collect {|o| [o.name, o.id]})
++  end
+ end
+diff --git test/unit/project_test.rb b/test/unit/project_test.rb
+index ec28b4db8e..475f35211d 100644
+--- a/test/unit/project_test.rb
++++ b/test/unit/project_test.rb
+@@ -1028,4 +1028,13 @@ class ProjectTest < ActiveSupport::TestCase
+       Project.distinct.visible.to_a
+     end
+   end
++
++  def test_default_query
++    query = IssueQuery.create!(:name => "test", :user_id => 1, :visibility => IssueQuery::VISIBILITY_PUBLIC, :project => @project)
++    project = Project.find(1)
++    project.default_query_id = query.id
++    project.save!
++
++    assert_equal query, project.default_query
++  end
+ end
+diff --git test/unit/query_test.rb b/test/unit/query_test.rb
+index 5b9886dd99..a17a7bb761 100644
+--- a/test/unit/query_test.rb
++++ b/test/unit/query_test.rb
+@@ -1285,6 +1285,24 @@ class QueryTest < ActiveSupport::TestCase
+     end
+   end
+ 
++  def test_available_query_should_return_true_when_public_query_existed_on_project
++    project = Project.find(1)
++    IssueQuery.only_public.destroy_all
++    public_issue_query_on_project = IssueQuery.create!(:name => "q", :user => User.find(2), :visibility => IssueQuery::VISIBILITY_PUBLIC, :project => project)
++    public_issue_query_nil_project = IssueQuery.create!(:name => "q", :user => User.find(2), :visibility => IssueQuery::VISIBILITY_PUBLIC, :project => nil)
++    assert IssueQuery.available_query?(project.id, public_issue_query_on_project.id)
++    assert IssueQuery.available_query?(project.id, public_issue_query_nil_project.id)
++  end
++
++  def test_available_query_should_return_false_when_public_query_does_not_existed_on_project
++    project = Project.find(1)
++    IssueQuery.only_public.destroy_all
++    private_issue_query_on_project = IssueQuery.create!(:name => "q", :user => User.find(2), :visibility => IssueQuery::VISIBILITY_PRIVATE, :project => project)
++    public_issue_query_on_other = IssueQuery.create!(:name => "q", :user => User.find(2), :visibility => IssueQuery::VISIBILITY_PUBLIC, :project => Project.find(2))
++    assert_equal false, IssueQuery.available_query?(project.id, private_issue_query_on_project.id)
++    assert_equal false, IssueQuery.available_query?(project.id, public_issue_query_on_other.id)
++  end
++
+   def test_default_columns
+     q = IssueQuery.new
+     assert q.columns.any?
+@@ -1835,6 +1853,34 @@ class QueryTest < ActiveSupport::TestCase
+     assert_nil IssueQuery.visible(User.find(1)).find_by_id(q.id)
+   end
+ 
++  def test_project_default_query_should_clear_when_default_query_chenged_public_to_other
++    q = IssueQuery.create!(:name => 'DefaultQuery', :visibility => IssueQuery::VISIBILITY_PUBLIC, :user => User.find(7))
++    projects = [Project.find(1), Project.find(2)]
++    projects.each { |p| p.update_attributes!(:default_query_id => q.id) }
++
++    q.update_attributes!(:visibility => IssueQuery::VISIBILITY_PRIVATE)
++    projects.each { |p| assert_nil p.reload.default_query }
++
++    q.update_attributes!(:visibility => IssueQuery::VISIBILITY_PUBLIC)
++    projects.each do |p|
++      p.update_attributes!(:default_query_id => q.id)
++      assert_equal q, p.default_query
++    end
++
++    q.update_attributes!(:visibility => IssueQuery::VISIBILITY_ROLES, :role_ids => [1, 2])
++    projects.each { |p| assert_nil p.reload.default_query }
++  end
++
++  def test_project_default_query_should_clear_when_destroied_default_query
++    q = IssueQuery.create!(:name => 'DefaultQuery', :visibility => IssueQuery::VISIBILITY_PUBLIC, :user => User.find(7))
++    projects = [Project.find(1), Project.find(2)]
++    projects.each { |p| p.update_attributes!(:default_query_id => q.id) }
++
++    q.destroy
++
++    projects.each { |p| assert_nil p.reload.default_query }
++  end
++
+   test "#available_filters should include users of visible projects in cross-project view" do
+     users = IssueQuery.new.available_filters["assigned_to_id"]
+     assert_not_nil users
